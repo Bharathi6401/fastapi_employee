@@ -1,13 +1,12 @@
 
 from fastapi import FastAPI, HTTPException, Depends, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from database import engine, Base
 import models
 from sqlalchemy.orm import Session
 from database import get_db
 
 
-Base.metadata.create_all(bind=engine)
+
 
 app = FastAPI()
 
@@ -16,6 +15,16 @@ def get_employees(db: Session = Depends(get_db)):
     employees = db.query(models.Employee).all()
     return employees
 
+
+@app.get("/employees/{employee_id}")
+def get_employee_by_id(employee_id: int,db: Session = Depends(get_db)):
+    employee=db.query(models.Employee).filter(models.Employee.id ==employee_id).first()
+
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    return employee
+   
 class EmployeeCreate(BaseModel):
     name: str
     email: EmailStr
@@ -23,6 +32,12 @@ class EmployeeCreate(BaseModel):
 
 @app.post("/employees/", status_code=201)
 def create_employee(employee: EmployeeCreate, db: Session = Depends(get_db)):
+    existing_employee = db.query(models.Employee).filter(models.Employee.email == employee.email).first()
+    if existing_employee:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
     new_employee = models.Employee(
         name=employee.name,
         email=employee.email,
