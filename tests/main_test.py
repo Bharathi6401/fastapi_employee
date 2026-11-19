@@ -1,33 +1,55 @@
 from fastapi.testclient import TestClient
-from main import app
+from main import app, get_current_user
 from database import get_db, Base
-from test_database import test_engine, override_get_db
-from test_database import TestingSessionLocal
+from tests.test_database import test_engine, override_get_db
+from tests.test_database import TestingSessionLocal
 import models
 Base.metadata.create_all(bind=test_engine)
 
 import pytest
 
+# @pytest.fixture
+# def client():
+#     app.dependency_overrides[get_db] = override_get_db
+
+#     with TestClient(app) as test_client:
+#         yield test_client
+
+#     app.dependency_overrides.clear()
 @pytest.fixture
 def client():
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: "test_user@example.com"
 
     with TestClient(app) as test_client:
         yield test_client
 
     app.dependency_overrides.clear()
 
+# @pytest.fixture(autouse=True)
+# def clean_test_database():
+#     yield
 
+#     db = TestingSessionLocal()
+#     try:
+#         db.query(models.Employee).delete()
+#         db.commit()
+#     finally:
+#         db.close()
 @pytest.fixture(autouse=True)
 def clean_test_database():
-    yield
 
-    db = TestingSessionLocal()
-    try:
-        db.query(models.Employee).delete()
-        db.commit()
-    finally:
-        db.close()
+    def cleanup():
+        db = TestingSessionLocal()
+        try:
+            db.query(models.Employee).delete()
+            db.commit()
+        finally:
+            db.close()
+
+    cleanup()  # Before each test
+    yield
+    cleanup()  # After each test
 
 # def test_home():
 #     response = client.get("/")
@@ -55,6 +77,22 @@ def test_get_employees(client):
     # 4. Check employee name
     assert response.json()[0]["name"] == "Jaya"
 
+
+def test_employee_count(client):
+    client.post("/employees",json={
+                "name": "Andrew",
+                "email": "jaya_tfgdgfdgest@gmail.com",
+                "age": 25
+            })
+    client.post("/employees",json={
+                    "name": "Abel",
+                    "email": "jaya_tfbdgfgdgfdgest@gmail.com",
+                    "age": 25
+                })
+    response=client.get("/employees/count")
+    assert response.status_code==200
+    assert response.json()["total_employees"] == 2
+
 def test_get_employee_by_id(client):
     create_response=client.post("/employees",
                                 json={"name":"jaya","email":"jaya@gmail.com","age":25})
@@ -68,16 +106,10 @@ def test_get_employee_by_id(client):
 def test_create_employee(client):
     response = client.post(
         "/employees/",
-        json={
-            "name": "Arun",
-            "email": "arun_test@gmail.com",
-            "age": 25
-        }
-    )
-
+        json={"name":"Jaya","email":"jaya@gmail.com","age":25},)
     assert response.status_code == 201
-    assert response.json()["name"] == "Arun"
-    assert response.json()["email"] == "arun_test@gmail.com"
+    assert response.json()["name"] == "Jaya"
+    assert response.json()["email"] == "jaya@gmail.com"
 
 
 
@@ -115,8 +147,8 @@ def test_update_employee_not_found(client):
         json={"name": "Kumar"}
     )
 
-    assert update_response.status_code == 404
-    assert update_response.json()["detail"] == "Employee not found"
+    assert update_response.json()["success"] is False
+    assert update_response.json()["message"] == "Resource not found"
 
 
 def test_delete_employee(client):
@@ -138,8 +170,8 @@ def test_delete_employee_not_found(client):
             "/employees/9999"
         )
     
-    assert delete_response.status_code == 404
-    assert delete_response.json()["detail"] == "Employee not found"
+    assert delete_response.json()["success"] is False
+    assert delete_response.json()["message"] == "Resource not found"
     
 
     
@@ -176,5 +208,40 @@ def test_create_employee_duplicate_email(client):
         }
     )
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Email already registered"
+    assert response.json()["success"] is False
+    assert response.json()["message"] == "Email already registered"
+
+
+def test_update_employee_duplicate_email(client):
+    client.post(
+    "/employees/",
+    json={
+        "name": "Jaya",
+        "email": "jaya@gmail.com",
+        "age": 25
+    }
+)
+    create_response=client.post("/employees/",json={"name":"Saran",
+                                                    "email":"saran@gmail.com",
+                                                    "age":25},
+                                                  )
+    employee_id=create_response.json()["id"]
+
+    update_response=client.patch(f"/employees/{employee_id}",
+                 json={"email":"jaya@gmail.com"},
+                 )
+    assert update_response.status_code==400
+    assert update_response.json()["message"] == "Email already registered"
+
+def test_update_employee_invalid_id(client):
+    response = client.patch(
+        "/employees/-2",
+        json={"name": "Kumar"}
+    )
+
+    assert response.status_code == 422
+
+def test_get_employee_invalid_id(client):
+    response = client.get("/employees/-2")
+
+    assert response.status_code == 422

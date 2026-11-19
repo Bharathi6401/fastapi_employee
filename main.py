@@ -7,9 +7,34 @@ from database import get_db
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi import Path
+from fastapi.security import OAuth2PasswordRequestForm
 
 import logging
+from schemas import UserCreate, UserLogin
+from security import hash_password, verify_password
+from auth import create_access_token, oauth2_scheme, verify_access_token
 
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = verify_access_token(token)
+
+    if payload is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    email = payload.get("sub")
+
+    if email is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return email
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -42,6 +67,9 @@ async def duplicate_found_handler(request:Request, exc):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+
+    logger.exception("Unexpected error occurred")
+
     return JSONResponse(
         status_code=500,
         content={
@@ -49,17 +77,60 @@ async def global_exception_handler(request: Request, exc: Exception):
             "message": "Internal server error"
         }
     )
+@app.post("/register", status_code=201)
+def register_user(user: UserCreate,db : Session = Depends(get_db)):
+    existing_user = db.query(models.User).filter(
+    models.User.email == user.email).first()
 
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    hashed_password=hash_password(user.password)
+    new_user=models.User(email=user.email,hashed_password=hashed_password)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {
+    "id": new_user.id,
+    "email": new_user.email,
+    "message": "User registered successfully"
+}
+
+@app.post("/login")
+def login_user(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(
+        models.User.email == form_data.username).first()
+    if not db_user:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password")
+    if not verify_password(form_data.password, db_user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+    access_token=create_access_token(data={"sub":db_user.email})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 @app.get(
     "/employees/",
     summary="Get all employees",
     description="Retrieve all employee records from the database."
 )
-def get_employees(db: Session = Depends(get_db)):
+def get_employees(db: Session = Depends(get_db) ,current_user: str = Depends(get_current_user)):
     employees = db.query(models.Employee).all()
     return employees
 
-
+@app.get("/employees/count")
+def employee_count(db: Session=Depends(get_db),current_user: str = Depends(get_current_user)):
+    employee_count=db.query(models.Employee).count()
+    return {"total_employees":employee_count}
 
 class EmployeeResponse(BaseModel):
     id: int
@@ -107,7 +178,7 @@ def get_employee_by_id(
     employee_id: int = Path(gt=0,
         description="Enter the employee ID to retrieve"
     ),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),current_user: str = Depends(get_current_user)
 ):
     employee = db.query(models.Employee).filter(
         models.Employee.id == employee_id
@@ -131,7 +202,7 @@ def get_employee_by_id(
         422: {"description": "Validation error"}
     }
 )
-def create_employee(employee: EmployeeCreate, db: Session = Depends(get_db)):
+def create_employee(employee: EmployeeCreate, db: Session = Depends(get_db),current_user: str = Depends(get_current_user)):
     logger.info("Creating a new employee")
     existing_employee = db.query(models.Employee).filter(models.Employee.email == employee.email).first()
     if existing_employee:
@@ -166,7 +237,29 @@ class EmployeeUpdate(BaseModel):
         422: {"description": "Validation error"}
     }
 )
-def update_employee(employee_id: int, employee: EmployeeUpdate, db: Session = Depends(get_db)):
+# def update_employee(employee_id: int, employee: EmployeeUpdate, db: Session = Depends(get_db)):
+#     update = db.query(models.Employee).filter(
+#         models.Employee.id == employee_id
+#     ).first()
+
+#     if not update:
+#         raise HTTPException(status_code=404, detail="Employee not found")
+
+#     update_data = employee.model_dump(exclude_unset=True)
+
+#     for key, value in update_data.items():
+#         setattr(update, key, value)
+
+#     db.commit()
+#     logger.info("Employee updated successfully")
+#     db.refresh(update)
+
+#     return update
+def update_employee(
+    employee: EmployeeUpdate,
+    employee_id: int = Path(gt=0),
+    db: Session = Depends(get_db),current_user: str = Depends(get_current_user)
+):
     update = db.query(models.Employee).filter(
         models.Employee.id == employee_id
     ).first()
@@ -175,6 +268,19 @@ def update_employee(employee_id: int, employee: EmployeeUpdate, db: Session = De
         raise HTTPException(status_code=404, detail="Employee not found")
 
     update_data = employee.model_dump(exclude_unset=True)
+
+    # Check duplicate email
+    if "email" in update_data:
+        existing_employee = db.query(models.Employee).filter(
+            models.Employee.email == update_data["email"],
+            models.Employee.id != employee_id
+        ).first()
+
+        if existing_employee:
+            raise HTTPException(
+                status_code=400,
+                detail="Email already registered"
+            )
 
     for key, value in update_data.items():
         setattr(update, key, value)
@@ -186,7 +292,6 @@ def update_employee(employee_id: int, employee: EmployeeUpdate, db: Session = De
     return update
 
 
-
 @app.delete(
     "/employees/{employee_id}",
     status_code=204,
@@ -196,14 +301,16 @@ def update_employee(employee_id: int, employee: EmployeeUpdate, db: Session = De
         404: {"description": "Employee not found"}
     }
 )
-def delete_employee(employee_id:int, db:Session= Depends(get_db)):
+def delete_employee(employee_id:int, db:Session= Depends(get_db),current_user: str = Depends(get_current_user)):
     logger.info("deleting an employee")
     delete_employee=db.query(models.Employee).filter(models.Employee.id ==employee_id).first()
     if not delete_employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     db.delete(delete_employee)
     db.commit()
+    logger.info("Employee deleted successfully")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 # @app.get("/")
 # def home():
