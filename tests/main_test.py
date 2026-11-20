@@ -4,10 +4,21 @@ from database import get_db, Base
 from tests.test_database import test_engine, override_get_db
 from tests.test_database import TestingSessionLocal
 import models
+import httpx
 Base.metadata.create_all(bind=test_engine)
 
 import pytest
+@pytest.fixture
+def unauthenticated_client():
+    app.dependency_overrides[get_db] = override_get_db
 
+    # Ensure authentication is not overridden
+    app.dependency_overrides.pop(get_current_user, None)
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
 # @pytest.fixture
 # def client():
 #     app.dependency_overrides[get_db] = override_get_db
@@ -245,3 +256,160 @@ def test_get_employee_invalid_id(client):
     response = client.get("/employees/-2")
 
     assert response.status_code == 422
+
+def test_external_users(client, monkeypatch):
+
+    def mock_api(request):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "name": "Test User",
+                    "email": "test@gmail.com"
+                }
+            ]
+        )
+    mock_transport = httpx.MockTransport(mock_api)
+    real_async_client = httpx.AsyncClient
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(
+            transport=mock_transport,
+            **kwargs
+        )
+    )
+    response = client.get("/external-users")
+    assert response.status_code==200
+    assert response.json()[0]["name"]=="Test User"
+
+
+def test_external_api_failure(client, monkeypatch):
+
+    def mock_api(request):
+        return httpx.Response(500)
+
+    mock_transport = httpx.MockTransport(mock_api)
+    real_async_client = httpx.AsyncClient
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(
+            transport=mock_transport,
+            **kwargs
+        )
+    )
+
+    response = client.get("/external-users")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "External API returned an error"
+
+
+def test_external_api_unavailable(client, monkeypatch):
+
+    def mock_api(request):
+        raise httpx.ConnectError("Connection failed")
+
+    mock_transport = httpx.MockTransport(mock_api)
+    real_async_client = httpx.AsyncClient
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(
+            transport=mock_transport,
+            **kwargs
+        )
+    )
+
+    response = client.get("/external-users")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "External API is unavailable"
+def test_update_employee_empty_data(client):
+
+    # First create an employee
+    create_response = client.post(
+        "/employees/",
+        json={
+            "name": "Test Employee",
+            "email": "emptytest@gmail.com",
+            "age": 25
+        }
+    )
+
+    employee_id = create_response.json()["id"]
+
+    # Now send an empty PATCH request
+    response = client.patch(
+        f"/employees/{employee_id}",
+        json={}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "At least one field is required for update"
+
+import pytest
+
+@pytest.mark.parametrize(
+    "field",
+    ["name", "email", "age"]
+)
+def test_update_employee_null_fields(client, field):
+
+    create_response = client.post(
+        "/employees/",
+        json={
+            "name": "Test Employee",
+            "email": "nulltest@gmail.com",
+            "age": 25
+        }
+    )
+
+    assert create_response.status_code == 201
+
+    employee_id = create_response.json()["id"]
+
+    response = client.patch(
+        f"/employees/{employee_id}",
+        json={field: None}
+    )
+
+    assert response.status_code == 422
+def test_search_employees_by_age(client):
+    client.post(
+        "/employees/",
+        json={
+            "name": "Employee One",
+            "email": "one@gmail.com",
+            "age": 25
+        }
+    )
+
+    response = client.get(
+        "/employees/search",
+        params={"min_age": 20, "max_age": 35}
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+def test_search_employees_invalid_age_range(client):
+    response = client.get(
+        "/employees/search",
+        params={"min_age": 40, "max_age": 20}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == (
+        "min_age cannot be greater than max_age"
+    )
+def test_search_employees_without_authentication(
+    unauthenticated_client
+):
+    response = unauthenticated_client.get("/employees/search")
+
+    assert response.status_code == 401

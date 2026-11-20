@@ -1,6 +1,6 @@
 
-from fastapi import FastAPI, HTTPException, Depends, Response, status
-from pydantic import BaseModel, EmailStr, Field
+from fastapi import FastAPI, HTTPException, Depends, Response, status, Query
+from pydantic import BaseModel, EmailStr, Field,field_validator
 import models
 from sqlalchemy.orm import Session
 from database import get_db
@@ -8,11 +8,12 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi import Path
 from fastapi.security import OAuth2PasswordRequestForm
-
+import httpx
 import logging
 from schemas import UserCreate, UserLogin
 from security import hash_password, verify_password
 from auth import create_access_token, oauth2_scheme, verify_access_token
+from typing import Optional
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -118,6 +119,14 @@ def login_user(
         "access_token": access_token,
         "token_type": "bearer"
     }
+
+class EmployeeResponse(BaseModel):
+    id: int
+    name: str
+    email: EmailStr
+    age: int
+
+    model_config = {"from_attributes": True}
 @app.get(
     "/employees/",
     summary="Get all employees",
@@ -132,13 +141,42 @@ def employee_count(db: Session=Depends(get_db),current_user: str = Depends(get_c
     employee_count=db.query(models.Employee).count()
     return {"total_employees":employee_count}
 
-class EmployeeResponse(BaseModel):
-    id: int
-    name: str
-    email: EmailStr
-    age: int
 
-    model_config = {"from_attributes": True}
+@app.get(
+    "/employees/search",
+    response_model=list[EmployeeResponse],
+    summary="Search employees by age",
+    description="Filter employees using optional minimum and maximum age."
+)
+def search_employees(
+    min_age: Optional[int] = Query(default=None, ge=0),
+    max_age: Optional[int] = Query(default=None, ge=0),
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    if (
+        min_age is not None
+        and max_age is not None
+        and min_age > max_age
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="min_age cannot be greater than max_age"
+        )
+
+    query = db.query(models.Employee)
+
+    if min_age is not None:
+        query = query.filter(models.Employee.age >= min_age)
+
+    if max_age is not None:
+        query = query.filter(models.Employee.age <= max_age)
+
+    employees = query.all()
+
+    return employees
+
+
 class EmployeeCreate(BaseModel):
     name: str
     email: EmailStr
@@ -223,9 +261,17 @@ def create_employee(employee: EmployeeCreate, db: Session = Depends(get_db),curr
     return new_employee
 
 class EmployeeUpdate(BaseModel):
-    name: str | None=None
-    email: EmailStr |None = None
-    age : int | None =Field(default=None, ge=18, le=60)
+    name: str | None = None
+    email: EmailStr | None = None
+    age: int | None = Field(default=None, ge=18, le=60)
+
+    @field_validator("name", "email", "age")
+    @classmethod
+    def validate_not_null(cls, value):
+        if value is None:
+            raise ValueError("Field cannot be null")
+        return value
+
 @app.patch(
     "/employees/{employee_id}",
     status_code=200,
@@ -268,6 +314,11 @@ def update_employee(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     update_data = employee.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one field is required for update"
+        )
 
     # Check duplicate email
     if "email" in update_data:
@@ -311,7 +362,38 @@ def delete_employee(employee_id:int, db:Session= Depends(get_db),current_user: s
     logger.info("Employee deleted successfully")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+@app.get("/external-users")
+async def get_external_users(
+    current_user: str = Depends(get_current_user)
+):
+    url = "https://jsonplaceholder.typicode.com/users"
 
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+            users = response.json()
+
+            return [
+                {
+                    "id": user["id"],
+                    "name": user["name"],
+                    "email": user["email"]
+                }
+                for user in users
+            ]
+
+    except httpx.HTTPStatusError:
+        raise HTTPException(
+            status_code=502,
+            detail="External API returned an error"
+        )
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="External API is unavailable")
 # @app.get("/")
 # def home():
 #     return {"message": "Welcome to Employee Management API"}
